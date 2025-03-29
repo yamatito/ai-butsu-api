@@ -146,10 +146,10 @@ async def generate_answer(question: str) -> str:
 
     data = response.json()
     answer_text = data["choices"][0]["message"]["content"]
-
+    total_tokens = data.get("usage", {}).get("total_tokens", 0)
     # ★ ここで「...」を削除または置換（調整もOK）
     cleaned_answer = answer_text.replace("...", "。").strip()
-    return cleaned_answer
+    return cleaned_answer, total_tokens
 
 
 # ================================
@@ -167,15 +167,26 @@ async def new_chat(request: NewChatRequest):
     if not question:
         raise HTTPException(status_code=400, detail="質問が空です。")
 
+    # 🔥 回答 + 使用トークンを取得
+    answer, tokens_used = await generate_answer(question)
+    
+    # 🔥 トークン上限チェック & ログ記録
+    is_allowed = await check_token_limit_and_log(user_id, tokens_used)
+    if not is_allowed:
+        return {
+            "answer": "今日はここまでにしましょう。また明日、静かにお話しましょう。",
+            "limited": True
+        }
+
     async with db_pool.acquire() as db:
         user_exists = await db.fetchrow("SELECT id FROM auth.users WHERE id=$1", user_id)
     if not user_exists:
         raise HTTPException(status_code=404, detail="ユーザーが見つかりません")
 
     chat_id = str(uuid.uuid4())
-    answer = await generate_answer(question)
     if not isinstance(answer, str):
-      answer = "AIの返答処理中にエラーが発生しました。"
+        answer = "AIの返答処理中にエラーが発生しました。"
+
     embedding_str = "[" + ", ".join(["0.0"] * 1536) + "]"
 
     async with db_pool.acquire() as db:
@@ -186,7 +197,8 @@ async def new_chat(request: NewChatRequest):
         """, chat_id, chat_id, user_id, question, answer, embedding_str)
 
     save_chat_pair_to_storage(chat_id, question, answer)
-    return {"chat_id": chat_id, "message": "新しいチャットを作成しました"}
+    return {"chat_id": chat_id, "message": "新しいチャットを作成しました", "answer": answer}
+
 
 @app.post("/chat")
 async def add_message(request: ChatRequest):
@@ -196,7 +208,17 @@ async def add_message(request: ChatRequest):
     if not question:
         raise HTTPException(status_code=400, detail="質問が空です。")
 
-    answer = await generate_answer(question)
+    # 🔥 回答 + 使用トークンを取得
+    answer, tokens_used = await generate_answer(question)
+  # 🔥 トークン上限チェック & ログ記録
+    is_allowed = await check_token_limit_and_log(user_id, tokens_used)
+    if not is_allowed:
+        return {
+            "chat_id": chat_id,
+            "answer": "今日はここまでにしましょう。また明日、静かにお話しましょう。",
+            "limited": True
+        }
+    
     embedding_str = "[" + ", ".join(["0.0"] * 1536) + "]"
 
     async with db_pool.acquire() as db:
@@ -208,6 +230,7 @@ async def add_message(request: ChatRequest):
 
     save_message_pair_to_storage(chat_id, question, answer)
     return {"chat_id": chat_id, "question": question, "answer": answer}
+
 
 @app.get("/chat/{chat_id}")
 async def get_chat(chat_id: str):
@@ -395,3 +418,38 @@ async def get_liked_shared_words(user_id: str):
             ORDER BY f.created_at DESC
         """, user_id)
     return [dict(row) for row in rows]
+
+
+
+
+# ===================================================
+# トークン
+# ===================================================
+
+async def check_token_limit_and_log(user_id: str, tokens_used: int) -> bool:
+    today = datetime.date.today()
+
+    async with db_pool.acquire() as db:
+        row = await db.fetchrow("""
+            SELECT tokens_used FROM daily_token_usage
+            WHERE user_id = $1 AND date = $2
+        """, user_id, today)
+
+        if row:
+            total_used = row["tokens_used"] + tokens_used
+            if total_used > MAX_FREE_TOKENS_PER_DAY:
+                return False  # 上限超過
+            await db.execute("""
+                UPDATE daily_token_usage
+                SET tokens_used = $1, updated_at = NOW()
+                WHERE user_id = $2 AND date = $3
+            """, total_used, user_id, today)
+        else:
+            if tokens_used > MAX_FREE_TOKENS_PER_DAY:
+                return False  # 上限超過
+            await db.execute("""
+                INSERT INTO daily_token_usage (user_id, date, tokens_used)
+                VALUES ($1, $2, $3)
+            """, user_id, today, tokens_used)
+
+    return True
