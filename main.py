@@ -6,13 +6,14 @@ from pydantic import BaseModel
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from supabase import create_client
-from datetime import datetime
 import json
 import httpx
 import random
 import string
 from typing import Optional
 from fastapi import Query
+from fastapi.responses import JSONResponse
+from datetime import datetime, date  # ← date を追加！
 
 # ===================================================
 # 🔧 環境設定 & 接続初期化
@@ -173,10 +174,13 @@ async def new_chat(request: NewChatRequest):
     # 🔥 トークン上限チェック & ログ記録
     is_allowed = await check_token_limit_and_log(user_id, tokens_used)
     if not is_allowed:
-        return {
+     return JSONResponse(
+        status_code=200,
+        content={
             "answer": "今日はここまでにしましょう。また明日、静かにお話しましょう。",
             "limited": True
         }
+    )
 
     async with db_pool.acquire() as db:
         user_exists = await db.fetchrow("SELECT id FROM auth.users WHERE id=$1", user_id)
@@ -198,6 +202,7 @@ async def new_chat(request: NewChatRequest):
 
     save_chat_pair_to_storage(chat_id, question, answer)
     return {"chat_id": chat_id, "message": "新しいチャットを作成しました", "answer": answer}
+
 
 
 @app.post("/chat")
@@ -426,8 +431,11 @@ async def get_liked_shared_words(user_id: str):
 # トークン
 # ===================================================
 
+MAX_FREE_TOKENS_PER_DAY = 2000  # 無料ユーザーの1日の上限
+
+
 async def check_token_limit_and_log(user_id: str, tokens_used: int) -> bool:
-    today = datetime.date.today()
+    today = date.today()
 
     async with db_pool.acquire() as db:
         row = await db.fetchrow("""
