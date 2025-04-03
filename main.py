@@ -168,31 +168,29 @@ async def new_chat(request: NewChatRequest):
     if not question:
         raise HTTPException(status_code=400, detail="質問が空です。")
 
-    # 🔥 回答 + 使用トークンを取得
-    answer, tokens_used = await generate_answer(question)
-    
-    # 🔥 トークン上限チェック & ログ記録
-    is_allowed = await check_token_limit_and_log(user_id, tokens_used)
+    # 仮のトークン数でチェック（長さ + 平均回答分）
+    estimated_tokens = len(question) + 100
+    is_allowed = await check_token_limit_and_log(user_id, estimated_tokens)
     if not is_allowed:
-     return JSONResponse(
-        status_code=200,
-        content={
-            "answer": "今日はここまでにしましょう。また明日、静かにお話しましょう。",
-            "limited": True
-        }
-    )
+        return JSONResponse(
+            status_code=200,
+            content={
+                "answer": "今日はここまでにしましょう。また明日、静かにお話しましょう。",
+                "limited": True
+            }
+        )
 
-    async with db_pool.acquire() as db:
-        user_exists = await db.fetchrow("SELECT id FROM auth.users WHERE id=$1", user_id)
-    if not user_exists:
-        raise HTTPException(status_code=404, detail="ユーザーが見つかりません")
+    # 実回答生成と実トークン数取得
+    answer, tokens_used = await generate_answer(question)
 
+    # 差分を加算
+    token_diff = tokens_used - estimated_tokens
+    if token_diff > 0:
+        await check_token_limit_and_log(user_id, token_diff)
+
+    # DBに保存
     chat_id = str(uuid.uuid4())
-    if not isinstance(answer, str):
-        answer = "AIの返答処理中にエラーが発生しました。"
-
     embedding_str = "[" + ", ".join(["0.0"] * 1536) + "]"
-
     async with db_pool.acquire() as db:
         await db.execute("""
             INSERT INTO conversations
@@ -204,7 +202,6 @@ async def new_chat(request: NewChatRequest):
     return {"chat_id": chat_id, "message": "新しいチャットを作成しました", "answer": answer}
 
 
-
 @app.post("/chat")
 async def add_message(request: ChatRequest):
     chat_id = request.chat_id
@@ -213,19 +210,26 @@ async def add_message(request: ChatRequest):
     if not question:
         raise HTTPException(status_code=400, detail="質問が空です。")
 
-    # 🔥 回答 + 使用トークンを取得
-    answer, tokens_used = await generate_answer(question)
-  # 🔥 トークン上限チェック & ログ記録
-    is_allowed = await check_token_limit_and_log(user_id, tokens_used)
+    # 仮トークンで事前チェック（+100は回答の平均想定）
+    estimated_tokens = len(question) + 100
+    is_allowed = await check_token_limit_and_log(user_id, estimated_tokens)
     if not is_allowed:
         return {
             "chat_id": chat_id,
             "answer": "今日はここまでにしましょう。また明日、静かにお話しましょう。",
             "limited": True
         }
-    
-    embedding_str = "[" + ", ".join(["0.0"] * 1536) + "]"
 
+    # 実際の回答生成（+実際の使用トークン数）
+    answer, tokens_used = await generate_answer(question)
+
+    # 差分だけ再度加算
+    token_diff = tokens_used - estimated_tokens
+    if token_diff > 0:
+        await check_token_limit_and_log(user_id, token_diff)
+
+    # 会話保存
+    embedding_str = "[" + ", ".join(["0.0"] * 1536) + "]"
     async with db_pool.acquire() as db:
         await db.execute("""
             INSERT INTO conversations
@@ -234,6 +238,7 @@ async def add_message(request: ChatRequest):
         """, str(uuid.uuid4()), chat_id, user_id, question, answer, embedding_str)
 
     save_message_pair_to_storage(chat_id, question, answer)
+
     return {"chat_id": chat_id, "question": question, "answer": answer}
 
 
@@ -433,6 +438,24 @@ async def get_liked_shared_words(user_id: str):
 
 MAX_FREE_TOKENS_PER_DAY = 2000  # 無料ユーザーの1日の上限
 
+@app.get("/token_status")
+async def get_token_status(user_id: str):
+    today = date.today()
+    async with db_pool.acquire() as db:
+        row = await db.fetchrow("""
+            SELECT tokens_used FROM daily_token_usage
+            WHERE user_id = $1 AND date = $2
+        """, user_id, today)
+
+        used = row["tokens_used"] if row else 0
+        remaining = max(0, MAX_FREE_TOKENS_PER_DAY - used)
+
+        return {
+            "used": used,
+            "remaining": remaining,
+            "limit": MAX_FREE_TOKENS_PER_DAY
+        }
+    
 
 async def check_token_limit_and_log(user_id: str, tokens_used: int) -> bool:
     today = date.today()
@@ -461,3 +484,44 @@ async def check_token_limit_and_log(user_id: str, tokens_used: int) -> bool:
             """, user_id, today, tokens_used)
 
     return True
+
+
+@app.post("/ad_reward")
+async def ad_reward(payload: dict):
+    user_id = payload["user_id"]
+    await reward_tokens_for_ad(user_id)
+    return {"status": "ok", "msg": "トークンを回復しました"}
+
+# 広告視聴報酬
+TOKENS_ON_AD_WATCH = 500
+
+async def reward_tokens_for_ad(user_id: str):
+    today = date.today()
+    async with db_pool.acquire() as db:
+        row = await db.fetchrow("""
+            SELECT tokens_used FROM daily_token_usage
+            WHERE user_id = $1 AND date = $2
+        """, user_id, today)
+
+        if row:
+            current_used = row["tokens_used"]
+            # 500 ぶん使用量を減らす
+            new_used = current_used - TOKENS_ON_AD_WATCH
+            # 使用量はマイナスにはならないように 0 で止める
+            if new_used < 0:
+                new_used = 0
+            
+            await db.execute("""
+                UPDATE daily_token_usage
+                SET tokens_used = $1, updated_at = NOW()
+                WHERE user_id = $2 AND date = $3
+            """, new_used, user_id, today)
+        
+        else:
+            # まだ一度もレコードがない場合、トークン使用量 0 で作る
+            # ただし "増やす" というよりは usage=0 のまま or 負の値で表現する? 
+            # 安全策として usage=0 を作っておけば、現状のロジックでは「未使用」と同義になる
+            await db.execute("""
+                INSERT INTO daily_token_usage (user_id, date, tokens_used)
+                VALUES ($1, $2, 0)
+            """, user_id, today)
