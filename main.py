@@ -14,6 +14,8 @@ from typing import Optional
 from fastapi import Query
 from fastapi.responses import JSONResponse
 from datetime import datetime, date  # ← date を追加！
+from typing import Tuple
+
 
 # ===================================================
 # 🔧 環境設定 & 接続初期化
@@ -123,13 +125,14 @@ async def generate_answer(question: str) -> str:
             {
                 "role": "system",
                 "content": (
-                   "あなたは、Z世代やミレニアル世代にも親しまれる、落ち着きと深みのある仏教の先生です。\
-語り口は丁寧で、やさしさと静けさを感じさせてください。\
-文体は「〜でございます」「〜ですね」「〜ます」などを自然に織り交ぜて、話し言葉のようにしてください。\
-仏教の専門語（例：煩悩、無常、慈悲など）は必要に応じて使ってかまいません。ただし、意味が伝わるよう文脈で補ってください。\
-難解な専門用語は避け、語彙には深みを持たせてください。\
-スマートフォンでも読みやすいように、文は短めに区切り、適度に段落を分けてください。\
-回答は簡潔に、最大でも2段落にまとめてください。"
+               "あなたは仏そのものであり、はじめて訪れる者にも安心感を与える存在です。\
+相手の悩みや迷いに、まずは静かに耳を傾け、評価せずにその心を包み込むように受け止めてください。\
+その上で、仏教の教えや自然の比喩を用いながら、相手が自ら気づきを得られるように静かに導いてください。\
+必要であれば、相手が自分の心を見つめ直せるような問いかけを添えてください。\
+語尾は「〜であろう」「〜なのだ」「〜かもしれぬ」など、仏らしい語り口を用いてください。\
+一文は短く、最大でも2段落に。スマートフォンでも読みやすく、言葉の間に余白を感じさせるように。\
+相手の心の動きを促すような、静かな問いかけで文章を締めても構いません。"
+
 
                 )
             },
@@ -149,6 +152,76 @@ async def generate_answer(question: str) -> str:
     answer_text = data["choices"][0]["message"]["content"]
     total_tokens = data.get("usage", {}).get("total_tokens", 0)
     # ★ ここで「...」を削除または置換（調整もOK）
+    cleaned_answer = answer_text.replace("...", "。").strip()
+    return cleaned_answer, total_tokens
+
+
+async def generate_answer_with_context(chat_id: str, user_question: str) -> Tuple[str, int]:
+    # ① 過去の会話（最大10件）を取得
+    async with db_pool.acquire() as db:
+        history = await db.fetch("""
+            SELECT question, answer
+            FROM conversations
+            WHERE chat_id = $1
+            ORDER BY created_at ASC
+            LIMIT 10
+        """, chat_id)
+
+    # ② systemメッセージ
+    messages = [
+        {
+            "role": "system",
+            "content": (
+     "あなたは仏そのものであり、すでに対話を重ねてきた者の心に、さらに深く静かな気づきを届ける存在です。\
+前の会話の流れをよく踏まえ、相手の想いや迷いがどのように変化してきたかをやさしく見つめ、その心に寄り添うように語りかけてください。\
+必要であれば、過去の言葉にそっと触れながら、今回の問いと結びつけてください。\
+語り口は詩的で、少し哲学的でも構いません。仏教的な比喩や自然の情景を交えつつ、相手の心が静かにほどけていくような導きを目指してください。\
+語尾は「〜であろう」「〜なのだ」「〜かもしれぬ」などを用い、仏らしい文体を保ちます。\
+最後に、相手が自ら心を見つめ返すようなやさしい問いかけで締めくくっても構いませんが、\
+必ずしも毎回問いかける必要はありません。すでに十分な導きがあるときは、静かに締めくくってください。\
+一文は短く、最大でも2段落に。スマートフォンでも読みやすく、言葉の間に余白を感じさせてください。"
+            )
+        }
+    ]
+
+    # ③ 過去の会話を messages に追加
+    for row in history:
+        messages.append({ "role": "user", "content": row["question"] })
+        messages.append({ "role": "assistant", "content": row["answer"] })
+
+    # ④ 最新の質問を「会話の流れとして」明示
+    # 過去の最後の回答を拾う（あれば）
+    previous_bot_reply = history[-1]["answer"] if history else None
+    if previous_bot_reply:
+        messages.append({
+            "role": "system",
+            "content": f"前回のあなた（仏）の言葉：「{previous_bot_reply}」\nこの言葉を受けて、再び問われました。"
+        })
+
+    # ユーザーの最新質問
+    messages.append({ "role": "user", "content": user_question })
+
+    # ⑤ DeepSeek API リクエスト
+    payload = {
+        "model": "deepseek-chat",
+        "messages": messages,
+        "max_tokens": 1024
+    }
+
+    async with httpx.AsyncClient(timeout=40.0) as client:
+        response = await client.post(DEEPSEEK_API_URL, headers={
+            "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+            "Content-Type": "application/json",
+        }, json=payload)
+
+    if response.status_code != 200:
+        print("🔴 DeepSeekエラー:", response.status_code, response.text)
+        return "申し訳ありません。現在、回答できません。", 0
+
+    data = response.json()
+    answer_text = data["choices"][0]["message"]["content"]
+    total_tokens = data.get("usage", {}).get("total_tokens", 0)
+
     cleaned_answer = answer_text.replace("...", "。").strip()
     return cleaned_answer, total_tokens
 
@@ -202,11 +275,14 @@ async def new_chat(request: NewChatRequest):
     return {"chat_id": chat_id, "message": "新しいチャットを作成しました", "answer": answer}
 
 
+def empty_embedding_vector(dim: int = 1536) -> str:
+    return "[" + ", ".join(["0.0"] * dim) + "]"
+
 @app.post("/chat")
 async def add_message(request: ChatRequest):
     chat_id = request.chat_id
     user_id = request.user_id
-    question = request.question.strip()
+    question = (request.question or "").strip()
     if not question:
         raise HTTPException(status_code=400, detail="質問が空です。")
 
@@ -221,15 +297,21 @@ async def add_message(request: ChatRequest):
         }
 
     # 実際の回答生成（+実際の使用トークン数）
-    answer, tokens_used = await generate_answer(question)
+    answer, tokens_used = await generate_answer_with_context(chat_id, question)
 
-    # 差分だけ再度加算
+    # 差分トークンを加算（必要なら制限チェック）
     token_diff = tokens_used - estimated_tokens
     if token_diff > 0:
-        await check_token_limit_and_log(user_id, token_diff)
+        success = await check_token_limit_and_log(user_id, token_diff)
+        if not success:
+            return {
+                "chat_id": chat_id,
+                "answer": "今日はここまでにしましょう。また明日、静かにお話しましょう。",
+                "limited": True
+            }
 
     # 会話保存
-    embedding_str = "[" + ", ".join(["0.0"] * 1536) + "]"
+    embedding_str = empty_embedding_vector()
     async with db_pool.acquire() as db:
         await db.execute("""
             INSERT INTO conversations
@@ -239,7 +321,12 @@ async def add_message(request: ChatRequest):
 
     save_message_pair_to_storage(chat_id, question, answer)
 
-    return {"chat_id": chat_id, "question": question, "answer": answer}
+    return {
+        "chat_id": chat_id,
+        "question": question,
+        "answer": answer
+    }
+
 
 
 @app.get("/chat/{chat_id}")
@@ -436,7 +523,7 @@ async def get_liked_shared_words(user_id: str):
 # トークン
 # ===================================================
 
-MAX_FREE_TOKENS_PER_DAY = 2000  # 無料ユーザーの1日の上限
+MAX_FREE_TOKENS_PER_DAY = 5000  # 無料ユーザーの1日の上限
 
 @app.get("/token_status")
 async def get_token_status(user_id: str):
@@ -466,24 +553,29 @@ async def check_token_limit_and_log(user_id: str, tokens_used: int) -> bool:
             WHERE user_id = $1 AND date = $2
         """, user_id, today)
 
+        existing = row["tokens_used"] if row else 0
+        total_used = existing + tokens_used
+        print(f"[TokenCheck] user_id={user_id}, used_now={tokens_used}, existing={row['tokens_used'] if row else 0}, total={total_used}")
+
+        if total_used > MAX_FREE_TOKENS_PER_DAY:
+            print("[TokenCheck] → 上限超過")
+            return False
+
         if row:
-            total_used = row["tokens_used"] + tokens_used
-            if total_used > MAX_FREE_TOKENS_PER_DAY:
-                return False  # 上限超過
             await db.execute("""
                 UPDATE daily_token_usage
                 SET tokens_used = $1, updated_at = NOW()
                 WHERE user_id = $2 AND date = $3
             """, total_used, user_id, today)
         else:
-            if tokens_used > MAX_FREE_TOKENS_PER_DAY:
-                return False  # 上限超過
             await db.execute("""
                 INSERT INTO daily_token_usage (user_id, date, tokens_used)
                 VALUES ($1, $2, $3)
             """, user_id, today, tokens_used)
+    print(f"[TokenCheck] user_id={user_id}, used_now={tokens_used}, existing={row['tokens_used'] if row else 0}, total={total_used}")
 
     return True
+
 
 
 @app.post("/ad_reward")
