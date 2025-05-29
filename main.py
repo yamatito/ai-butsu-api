@@ -77,6 +77,98 @@ class ShareWordRequest(BaseModel):
 class LikeRequest(BaseModel):
     user_id: str
     
+
+import os
+import uuid
+import asyncpg
+from dotenv import load_dotenv
+from pydantic import BaseModel
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from supabase import create_client
+import json
+import httpx
+import random
+import string
+from typing import Optional
+from fastapi import Query
+from fastapi.responses import JSONResponse
+from datetime import datetime, date  # ← date を追加！
+from typing import Tuple
+
+
+# ===================================================
+# 🔧 環境設定 & 接続初期化
+# ===================================================
+
+# 環境変数読み込み
+load_dotenv()
+
+app = FastAPI()
+DATABASE_URL = os.getenv("DATABASE_URL")
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+DEEPSEEK_API_URL = "https://api.deepseek.com/v1/chat/completions"
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
+
+# Supabase クライアント
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+# PostgreSQL プール
+db_pool = None
+
+async def init_db():
+    global db_pool
+    db_pool = await asyncpg.create_pool(DATABASE_URL, statement_cache_size=0)
+    print("✅ データベース接続成功")
+
+@app.on_event("startup")
+async def startup():
+    await init_db()
+
+# CORS設定
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:8081", "http://127.0.0.1:8081"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ================================
+# 📦 モデル定義（リクエスト受け取り用）
+# ================================
+
+class NewChatRequest(BaseModel):
+    user_id: str
+    question: str
+
+class ChatRequest(BaseModel):
+    chat_id: str
+    user_id: str
+    question: str
+
+class ShareWordRequest(BaseModel):
+    user_id: str
+    chat_id: str
+    content: str
+    comment: Optional[str] = None  # ← 一言コメント（任意）
+
+class LikeRequest(BaseModel):
+    user_id: str
+    
+class DeleteUserRequest(BaseModel):
+    user_id: str
+
+@app.post("/api/delete_user")
+async def delete_user(req: DeleteUserRequest):
+    try:
+        supabase.auth.admin.delete_user(req.user_id)
+        return {"status": "success", "message": "User deleted"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to delete user: {str(e)}")
+
+
 # ================================
 # 💾 ストレージユーティリティ（チャットログ保存）
 # ================================
