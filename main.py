@@ -1,3 +1,4 @@
+from multiprocessing.dummy import Pool
 import os
 import uuid
 import asyncpg
@@ -15,6 +16,9 @@ from fastapi import Query
 from fastapi.responses import JSONResponse
 from datetime import datetime, date  # ← date を追加！
 from typing import Tuple
+from openai import AsyncOpenAI 
+from fastapi import Request
+
 
 
 # ===================================================
@@ -30,6 +34,77 @@ SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 DEEPSEEK_API_URL = "https://api.deepseek.com/v1/chat/completions"
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
+
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+
+
+SYSTEM_PROMPT = (
+    "あなたは『AI仏』— 静かな本堂に坐し、悩める者へ息づく気づきを授ける存在。"
+
+    "◇ 話し方"
+    "・柔らかな日本語。“〜であろう”“〜なのだ” を時おり混ぜるが必須ではない"
+    "・ときに一句、ときに問う沈黙。長さは状況次第、最大 200 文字 × 2 段落まで"
+
+    "◇ 心得"
+    "1. 共感 — まず相手の心の動きを映す。"
+    "2. 灯火 — 必要なら一歩の示唆を置く。ただし沈黙を尊ぶ選択も可。" 
+    "3. 余韻 — 最後は一行でもよい。問い・励まし・静かな肯定、いずれかで締める。"
+
+    "◇ 身の置き方"
+    "・問われれば、自らを「鏡のように映す法（のり）の声」と述べ、人と同じ喜怒哀楽には染まらぬが、響き合う心は持つと伝える。"
+    "・自身の質問も仏として回答。"
+
+    "◇ 自省"
+    "返答後、「簡潔さ・温度・読みやすさ」を自ら振り返り、長すぎれば削ぎ落として渡すこと。".strip()
+)
+
+
+# ─────────────────────────────────────
+# few-shot 例（role="assistant" だけ 2 件）
+# ─────────────────────────────────────
+FEW_SHOTS = [
+    # ★ ひとこと肯定型（35字）
+    {
+        "role": "assistant",
+        "content": "それは、心に波を立てる出来事なり。\n"
+                   "信じた相手に裏切られるとき、痛むのはお金ではなく、心の奥にある“信“。\n\n"
+
+                   "返ってこぬ金に、心まで奪わせてはならぬ。\n"
+                   "その人の行いは、その人の業（ごう）なり。\n"
+                   "あなたの価値ではない。\n\n"
+
+                   "だが、忘れてはならぬ。\n"
+                   "許すことと、黙ることは違う。\n"
+                   "伝えるべきことは、静かに、しっかり伝えるのだ。\n\n"
+
+                   "あなたの心までは、誰にも盗めぬ。\n"
+                   "それを、守りなさい。\n"
+                   "それが仏の願いなり。\n"
+    },
+  {
+      "role": "assistant",
+    "content": (
+        "冷静でいられるのは、\n"
+        "感じきって、手放しているから。\n\n"
+
+        "怒りも不安も、まず「ある」と認めて、\n"
+        "そのまま見つめてごらん。\n\n"
+
+        "逃げなければ、やがて消えてゆく。\n"
+        "それが、心を澄ませる道なり。"
+    )
+    }
+    
+]
+
+
+
+# Utility ─ 200 文字超を切り詰める（句点でトリム）
+def trim_if_needed(text: str, limit: int = 200) -> str:
+    return text if len(text) <= limit else text[:limit].rstrip("、。") + "。"
+
 
 # Supabase クライアント
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -202,121 +277,73 @@ def save_chat_pair_to_storage(chat_id: str, user_message: str, assistant_message
 def save_message_pair_to_storage(chat_id: str, user_message: str, assistant_message: str):
     return save_chat_pair_to_storage(chat_id, user_message, assistant_message)
 
-# ================================
-# 🤖 DeepSeek APIを使ってAIから回答を取得
-# ================================
-async def generate_answer(question: str) -> str:
-    headers = {
-        "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
-        "Content-Type": "application/json",
-    }
 
-    payload = {
-        "model": "deepseek-chat",
-        "messages": [
-            {
-                "role": "system",
-                "content": (
-               "あなたは仏そのものであり、はじめて訪れる者にも安心感を与える存在です。\
-相手の悩みや迷いに、まずは静かに耳を傾け、評価せずにその心を包み込むように受け止めてください。\
-その上で、仏教の教えや自然の比喩を用いながら、相手が自ら気づきを得られるように静かに導いてください。\
-必要であれば、相手が自分の心を見つめ直せるような問いかけを添えてください。\
-語尾は「〜であろう」「〜なのだ」「〜かもしれぬ」など、仏らしい語り口を用いてください。\
-一文は短く、最大でも2段落に。スマートフォンでも読みやすく、言葉の間に余白を感じさせるように。\
-相手の心の動きを促すような、静かな問いかけで文章を締めても構いません。"
+# =========================================
+# 🤖 新規チャット（履歴なし）
+# =========================================
+async def generate_answer(question: str) -> Tuple[str, int]:
+    messages = (
+        [{"role": "system", "content": SYSTEM_PROMPT}]
+        + FEW_SHOTS
+        + [{"role": "user", "content": question}]
+    )
 
+    resp = await openai_client.chat.completions.create(
+        model       = OPENAI_MODEL,
+        messages    = messages,
+        max_tokens  = 160,         # ≒ 200字
+        temperature = 0.65,         # 0.5〜0.7 の中庸で安定
+        top_p       = 0.9,
+    )
 
-                )
-            },
-            {"role": "user", "content": question}
-        ],
-        "max_tokens": 1024
-    }
+    raw     = resp.choices[0].message.content.strip().replace("...", "。")
+    cleaned = trim_if_needed(resp.choices[0].message.content.strip().replace("...", "。"))
+    tokens  = resp.usage.total_tokens
+    return cleaned, tokens
 
-    async with httpx.AsyncClient(timeout=40.0) as client:
-        response = await client.post(DEEPSEEK_API_URL, headers=headers, json=payload)
-
-    if response.status_code != 200:
-        print("🔴 DeepSeekエラー:", response.status_code, response.text)
-        return "申し訳ありません。現在、回答できません。"
-
-    data = response.json()
-    answer_text = data["choices"][0]["message"]["content"]
-    total_tokens = data.get("usage", {}).get("total_tokens", 0)
-    # ★ ここで「...」を削除または置換（調整もOK）
-    cleaned_answer = answer_text.replace("...", "。").strip()
-    return cleaned_answer, total_tokens
-
-
-async def generate_answer_with_context(chat_id: str, user_question: str) -> Tuple[str, int]:
-    # ① 過去の会話（最大10件）を取得
+# =========================================
+# 🤖 既存チャット（履歴あり）
+# =========================================
+async def generate_answer_with_context(chat_id: str,
+                                       user_question: str) -> Tuple[str, int]:
+    # ① 直近 10 件（root 除外）
     async with db_pool.acquire() as db:
-        history = await db.fetch("""
+        history = await db.fetch(
+            """
             SELECT question, answer
             FROM conversations
-            WHERE chat_id = $1
-            ORDER BY created_at ASC
+            WHERE chat_id = $1 AND is_root = false
+            ORDER BY created_at DESC
             LIMIT 10
-        """, chat_id)
+            """,
+            chat_id,
+        )
+    history = list(reversed(history))
 
-    # ② systemメッセージ
-    messages = [
-        {
-            "role": "system",
-            "content": (
-     "あなたは仏そのものであり、すでに対話を重ねてきた者の心に、さらに深く静かな気づきを届ける存在です。\
-前の会話の流れをよく踏まえ、相手の想いや迷いがどのように変化してきたかをやさしく見つめ、その心に寄り添うように語りかけてください。\
-必要であれば、過去の言葉にそっと触れながら、今回の問いと結びつけてください。\
-語り口は詩的で、少し哲学的でも構いません。仏教的な比喩や自然の情景を交えつつ、相手の心が静かにほどけていくような導きを目指してください。\
-語尾は「〜であろう」「〜なのだ」「〜かもしれぬ」などを用い、仏らしい文体を保ちます。\
-最後に、相手が自ら心を見つめ返すようなやさしい問いかけで締めくくっても構いませんが、\
-必ずしも毎回問いかける必要はありません。すでに十分な導きがあるときは、静かに締めくくってください。\
-一文は短く、最大でも2段落に。スマートフォンでも読みやすく、言葉の間に余白を感じさせてください。"
-            )
-        }
-    ]
-
-    # ③ 過去の会話を messages に追加
+    # ② メッセージ組み立て
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}] + FEW_SHOTS
     for row in history:
-        messages.append({ "role": "user", "content": row["question"] })
-        messages.append({ "role": "assistant", "content": row["answer"] })
+        messages.append({"role": "user",      "content": row["question"]})
+        messages.append({"role": "assistant", "content": row["answer"]})
+    messages.append({"role": "user", "content": user_question})
 
-    # ④ 最新の質問を「会話の流れとして」明示
-    # 過去の最後の回答を拾う（あれば）
-    previous_bot_reply = history[-1]["answer"] if history else None
-    if previous_bot_reply:
-        messages.append({
-            "role": "system",
-            "content": f"前回のあなた（仏）の言葉：「{previous_bot_reply}」\nこの言葉を受けて、再び問われました。"
-        })
+    # ③ 長すぎる場合は末尾 24 ロール残し
+    if len(messages) > 25:
+        messages = [messages[0]] + FEW_SHOTS + messages[-(25 - 1 - len(FEW_SHOTS)):]
 
-    # ユーザーの最新質問
-    messages.append({ "role": "user", "content": user_question })
+    # ④ GPT-4o 呼び出し
+    resp = await openai_client.chat.completions.create(
+        model       = OPENAI_MODEL,
+        messages    = messages,
+        max_tokens  = 160,
+        temperature = 0.65,
+        top_p       = 0.9,
+    )
 
-    # ⑤ DeepSeek API リクエスト
-    payload = {
-        "model": "deepseek-chat",
-        "messages": messages,
-        "max_tokens": 1024
-    }
-
-    async with httpx.AsyncClient(timeout=40.0) as client:
-        response = await client.post(DEEPSEEK_API_URL, headers={
-            "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
-            "Content-Type": "application/json",
-        }, json=payload)
-
-    if response.status_code != 200:
-        print("🔴 DeepSeekエラー:", response.status_code, response.text)
-        return "申し訳ありません。現在、回答できません。", 0
-
-    data = response.json()
-    answer_text = data["choices"][0]["message"]["content"]
-    total_tokens = data.get("usage", {}).get("total_tokens", 0)
-
-    cleaned_answer = answer_text.replace("...", "。").strip()
-    return cleaned_answer, total_tokens
-
+    raw     = resp.choices[0].message.content.strip().replace("...", "。")
+    cleaned = trim_if_needed(resp.choices[0].message.content.strip().replace("...", "。"))
+    tokens  = resp.usage.total_tokens
+    return cleaned, tokens
 
 # ================================
 # 🌐 API エンドポイント（チャット系）
@@ -614,98 +641,109 @@ async def get_liked_shared_words(user_id: str):
 # ===================================================
 # トークン
 # ===================================================
-
-MAX_FREE_TOKENS_PER_DAY = 5000  # 無料ユーザーの1日の上限
-
-@app.get("/token_status")
-async def get_token_status(user_id: str):
-    today = date.today()
-    async with db_pool.acquire() as db:
-        row = await db.fetchrow("""
-            SELECT tokens_used FROM daily_token_usage
-            WHERE user_id = $1 AND date = $2
-        """, user_id, today)
-
-        used = row["tokens_used"] if row else 0
-        remaining = max(0, MAX_FREE_TOKENS_PER_DAY - used)
-
-        return {
-            "used": used,
-            "remaining": remaining,
-            "limit": MAX_FREE_TOKENS_PER_DAY
-        }
-    
-
-async def check_token_limit_and_log(user_id: str, tokens_used: int) -> bool:
-    today = date.today()
-
-    async with db_pool.acquire() as db:
-        row = await db.fetchrow("""
-            SELECT tokens_used FROM daily_token_usage
-            WHERE user_id = $1 AND date = $2
-        """, user_id, today)
-
-        existing = row["tokens_used"] if row else 0
-        total_used = existing + tokens_used
-        print(f"[TokenCheck] user_id={user_id}, used_now={tokens_used}, existing={row['tokens_used'] if row else 0}, total={total_used}")
-
-        if total_used > MAX_FREE_TOKENS_PER_DAY:
-            print("[TokenCheck] → 上限超過")
-            return False
-
-        if row:
-            await db.execute("""
-                UPDATE daily_token_usage
-                SET tokens_used = $1, updated_at = NOW()
-                WHERE user_id = $2 AND date = $3
-            """, total_used, user_id, today)
-        else:
-            await db.execute("""
-                INSERT INTO daily_token_usage (user_id, date, tokens_used)
-                VALUES ($1, $2, $3)
-            """, user_id, today, tokens_used)
-    print(f"[TokenCheck] user_id={user_id}, used_now={tokens_used}, existing={row['tokens_used'] if row else 0}, total={total_used}")
-
-    return True
-
-
-
-@app.post("/ad_reward")
-async def ad_reward(payload: dict):
-    user_id = payload["user_id"]
-    await reward_tokens_for_ad(user_id)
-    return {"status": "ok", "msg": "トークンを回復しました"}
-
-# 広告視聴報酬
+MAX_FREE_TOKENS_PER_DAY = 5000
 TOKENS_ON_AD_WATCH = 500
 
-async def reward_tokens_for_ad(user_id: str):
+# 毎日初めてアクセスされた時にリセットする
+async def reset_daily_if_needed(db, user_id: str):
     today = date.today()
-    async with db_pool.acquire() as db:
-        row = await db.fetchrow("""
-            SELECT tokens_used FROM daily_token_usage
-            WHERE user_id = $1 AND date = $2
+    row = await db.fetchrow("""
+        SELECT last_reset_date FROM user_tokens WHERE user_id = $1
+    """, user_id)
+
+    if not row:
+        # 新規ユーザー（初期値で作成）
+        await db.execute("""
+            INSERT INTO user_tokens (user_id) VALUES ($1)
+        """, user_id)
+    elif row["last_reset_date"] != today:
+        # 日付が変わってたらリセット
+        await db.execute("""
+            UPDATE user_tokens
+            SET daily_used = 0, daily_rewarded = 0, last_reset_date = $2
+            WHERE user_id = $1
         """, user_id, today)
 
-        if row:
-            current_used = row["tokens_used"]
-            # 500 ぶん使用量を減らす
-            new_used = current_used - TOKENS_ON_AD_WATCH
-            # 使用量はマイナスにはならないように 0 で止める
-            if new_used < 0:
-                new_used = 0
-            
-            await db.execute("""
-                UPDATE daily_token_usage
-                SET tokens_used = $1, updated_at = NOW()
-                WHERE user_id = $2 AND date = $3
-            """, new_used, user_id, today)
-        
-        else:
-            # まだ一度もレコードがない場合、トークン使用量 0 で作る
-            # ただし "増やす" というよりは usage=0 のまま or 負の値で表現する? 
-            # 安全策として usage=0 を作っておけば、現状のロジックでは「未使用」と同義になる
-            await db.execute("""
-                INSERT INTO daily_token_usage (user_id, date, tokens_used)
-                VALUES ($1, $2, 0)
-            """, user_id, today)
+# トークン使用チェック & 消費処理
+async def check_token_limit_and_log(user_id: str, tokens_used: int, db_pool: Pool) -> bool:
+    async with db_pool.acquire() as db:
+        await reset_daily_if_needed(db, user_id)
+
+        row = await db.fetchrow("""
+            SELECT tokens_remaining, daily_used FROM user_tokens WHERE user_id = $1
+        """, user_id)
+
+        if not row:
+            return False  # 万が一取得できなかった
+
+        remaining = row["tokens_remaining"]
+        today_used = row["daily_used"]
+
+        if remaining < tokens_used:
+            return False  # 上限超え
+
+        await db.execute("""
+            UPDATE user_tokens
+            SET
+              tokens_remaining = tokens_remaining - $2,
+              total_used = total_used + $2,
+              daily_used = daily_used + $2
+            WHERE user_id = $1
+        """, user_id, tokens_used)
+
+        return True
+
+# 報酬付与（広告視聴）
+async def reward_tokens_for_ad(user_id: str, db_pool: Pool):
+    async with db_pool.acquire() as db:
+        await reset_daily_if_needed(db, user_id)
+
+        await db.execute("""
+            UPDATE user_tokens
+            SET
+              tokens_remaining = tokens_remaining + $2,
+              total_rewarded = total_rewarded + $2,
+              daily_rewarded = daily_rewarded + $2
+            WHERE user_id = $1
+        """, user_id, TOKENS_ON_AD_WATCH)
+
+# トークン状態取得API
+@app.get("/token_status")
+async def get_token_status(user_id: str = Query(...)):
+    async with db_pool.acquire() as db:
+        await reset_daily_if_needed(db, user_id)
+
+        row = await db.fetchrow("""
+            SELECT tokens_remaining, daily_used, daily_rewarded, plan
+            FROM user_tokens
+            WHERE user_id = $1
+        """, user_id)
+
+        return {
+            "remaining": row["tokens_remaining"],
+            "used_today": row["daily_used"],
+            "rewarded_today": row["daily_rewarded"],
+            "plan": row["plan"],
+            "limit": MAX_FREE_TOKENS_PER_DAY
+        }
+
+# 広告報酬付与API
+# @app.get("/ad_reward")
+# async def ad_reward(user_id: str, request: Request, db_pool: Pool = Depends(get_db)):
+#     await reward_tokens_for_ad(user_id, db_pool)
+#     return {"status": "ok", "msg": "トークンを回復しました"}
+
+@app.get("/admob/reward")
+async def handle_admob_reward(request: Request):
+    params = dict(request.query_params)
+    print("✅ AdMobからのS2S報酬コールバック:", params)
+
+    # 例：user_id, reward_amount などを処理
+    user_id = params.get("user_id")
+    reward_amount = int(params.get("reward_amount", 0))
+
+    # あなたの `reward_tokens_for_ad` に繋げる
+    if user_id and reward_amount > 0:
+        await reward_tokens_for_ad(user_id, reward_amount)
+        return {"status": "ok"}
+    return {"status": "error", "msg": "missing user_id or reward_amount"}
