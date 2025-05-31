@@ -18,6 +18,8 @@ from datetime import datetime, date  # ← date を追加！
 from typing import Tuple
 from openai import AsyncOpenAI 
 from fastapi import Request
+from fastapi import  Depends
+
 
 
 
@@ -38,6 +40,7 @@ DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+
 
 
 SYSTEM_PROMPT = (
@@ -362,7 +365,7 @@ async def new_chat(request: NewChatRequest):
 
     # 仮のトークン数でチェック（長さ + 平均回答分）
     estimated_tokens = len(question) + 100
-    is_allowed = await check_token_limit_and_log(user_id, estimated_tokens)
+    is_allowed = await check_token_limit_and_log(user_id, estimated_tokens, db_pool)
     if not is_allowed:
         return JSONResponse(
             status_code=200,
@@ -674,7 +677,13 @@ async def check_token_limit_and_log(user_id: str, tokens_used: int, db_pool: Poo
         """, user_id)
 
         if not row:
-            return False  # 万が一取得できなかった
+            # ✅ ユーザー初回：レコードを自動作成
+            await db.execute("""
+                INSERT INTO user_tokens (user_id) VALUES ($1)
+            """, user_id)
+            row = await db.fetchrow("""
+                SELECT tokens_remaining, daily_used FROM user_tokens WHERE user_id = $1
+            """, user_id)
 
         remaining = row["tokens_remaining"]
         today_used = row["daily_used"]
@@ -693,8 +702,9 @@ async def check_token_limit_and_log(user_id: str, tokens_used: int, db_pool: Poo
 
         return True
 
+
 # 報酬付与（広告視聴）
-async def reward_tokens_for_ad(user_id: str, db_pool: Pool):
+async def reward_tokens_for_ad(user_id: str, reward_amount: int):
     async with db_pool.acquire() as db:
         await reset_daily_if_needed(db, user_id)
 
@@ -705,7 +715,8 @@ async def reward_tokens_for_ad(user_id: str, db_pool: Pool):
               total_rewarded = total_rewarded + $2,
               daily_rewarded = daily_rewarded + $2
             WHERE user_id = $1
-        """, user_id, TOKENS_ON_AD_WATCH)
+        """, user_id, reward_amount)
+
 
 # トークン状態取得API
 @app.get("/token_status")
@@ -714,18 +725,20 @@ async def get_token_status(user_id: str = Query(...)):
         await reset_daily_if_needed(db, user_id)
 
         row = await db.fetchrow("""
-            SELECT tokens_remaining, daily_used, daily_rewarded, plan
+            SELECT tokens_remaining, daily_used, daily_rewarded, plan, last_reset_date
             FROM user_tokens
             WHERE user_id = $1
         """, user_id)
 
         return {
             "remaining": row["tokens_remaining"],
-            "used_today": row["daily_used"],
-            "rewarded_today": row["daily_rewarded"],
+            "used": row["daily_used"],
+            "ad_reward_count": row["daily_rewarded"],
             "plan": row["plan"],
-            "limit": MAX_FREE_TOKENS_PER_DAY
+            "limit": MAX_FREE_TOKENS_PER_DAY,
+            "last_reset_date": row["last_reset_date"].isoformat() if row["last_reset_date"] else None
         }
+
 
 # 広告報酬付与API
 # @app.get("/ad_reward")
@@ -734,16 +747,17 @@ async def get_token_status(user_id: str = Query(...)):
 #     return {"status": "ok", "msg": "トークンを回復しました"}
 
 @app.get("/admob/reward")
-async def handle_admob_reward(request: Request):
+async def handle_admob_reward(
+    request: Request,
+):
     params = dict(request.query_params)
     print("✅ AdMobからのS2S報酬コールバック:", params)
 
-    # 例：user_id, reward_amount などを処理
     user_id = params.get("user_id")
     reward_amount = int(params.get("reward_amount", 0))
 
-    # あなたの `reward_tokens_for_ad` に繋げる
-    if user_id and reward_amount > 0:
-        await reward_tokens_for_ad(user_id, reward_amount)
-        return {"status": "ok"}
-    return {"status": "error", "msg": "missing user_id or reward_amount"}
+    if not user_id or reward_amount != 500:
+        return {"status": "error", "msg": "Invalid reward request"}
+
+    await reward_tokens_for_ad(user_id, reward_amount)
+    return {"status": "ok"}
