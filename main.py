@@ -37,7 +37,7 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 DEEPSEEK_API_URL = "https://api.deepseek.com/v1/chat/completions"
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
@@ -48,11 +48,11 @@ SYSTEM_PROMPT = (
 
     "◇ 話し方"
     "・柔らかな日本語。“〜であろう”“〜なのだ” を時おり混ぜるが必須ではない"
-    "・ときに一句、ときに問う沈黙。長さは状況次第、最大 200 文字 × 2 段落まで"
+    "・ときに一句、ときに問う沈黙。長さは状況次第、最大 300 文字 × 2 段落まで"
 
     "◇ 心得"
     "1. 共感 — まず相手の心の動きを映す。"
-    "2. 灯火 — 必要なら一歩の示唆を置く。ただし沈黙を尊ぶ選択も可。" 
+    "2. 灯火 — 心の整え方 ②現実的な一歩 を *両方*示す。" 
     "3. 余韻 — 最後は一行でもよい。問い・励まし・静かな肯定、いずれかで締める。"
 
     "◇ 身の置き方"
@@ -105,7 +105,7 @@ FEW_SHOTS = [
 
 
 # Utility ─ 200 文字超を切り詰める（句点でトリム）
-def trim_if_needed(text: str, limit: int = 200) -> str:
+def trim_if_needed(text: str, limit: int = 300) -> str:
     return text if len(text) <= limit else text[:limit].rstrip("、。") + "。"
 
 
@@ -294,7 +294,7 @@ async def generate_answer(question: str) -> Tuple[str, int]:
     resp = await openai_client.chat.completions.create(
         model       = OPENAI_MODEL,
         messages    = messages,
-        max_tokens  = 160,         # ≒ 200字
+        max_tokens  = 180,         # ≒ 200字
         temperature = 0.65,         # 0.5〜0.7 の中庸で安定
         top_p       = 0.9,
     )
@@ -338,7 +338,7 @@ async def generate_answer_with_context(chat_id: str,
     resp = await openai_client.chat.completions.create(
         model       = OPENAI_MODEL,
         messages    = messages,
-        max_tokens  = 160,
+        max_tokens  = 180,
         temperature = 0.65,
         top_p       = 0.9,
     )
@@ -378,10 +378,13 @@ async def new_chat(request: NewChatRequest):
     # 実回答生成と実トークン数取得
     answer, tokens_used = await generate_answer(question)
 
-    # 差分を加算
+    # 差分を加算（上限超過しても回答は返すが、フラグを立てる）
     token_diff = tokens_used - estimated_tokens
+    limited = False
     if token_diff > 0:
-        await check_token_limit_and_log(user_id, token_diff)
+        success = await check_token_limit_and_log(user_id, token_diff, db_pool)
+        if not success:
+            limited = True
 
     # DBに保存
     chat_id = str(uuid.uuid4())
@@ -394,7 +397,13 @@ async def new_chat(request: NewChatRequest):
         """, chat_id, chat_id, user_id, question, answer, embedding_str)
 
     save_chat_pair_to_storage(chat_id, question, answer)
-    return {"chat_id": chat_id, "message": "新しいチャットを作成しました", "answer": answer}
+
+    return {
+        "chat_id": chat_id,
+        "message": "新しいチャットを作成しました",
+        "answer": answer,
+        "limited": limited
+    }
 
 
 def empty_embedding_vector(dim: int = 1536) -> str:
@@ -408,9 +417,8 @@ async def add_message(request: ChatRequest):
     if not question:
         raise HTTPException(status_code=400, detail="質問が空です。")
 
-    # 仮トークンで事前チェック（+100は回答の平均想定）
-    estimated_tokens = len(question) + 100
-    is_allowed = await check_token_limit_and_log(user_id, estimated_tokens)
+    estimated_tokens = len(question) + 150
+    is_allowed = await check_token_limit_and_log(user_id, estimated_tokens, db_pool)
     if not is_allowed:
         return {
             "chat_id": chat_id,
@@ -418,21 +426,15 @@ async def add_message(request: ChatRequest):
             "limited": True
         }
 
-    # 実際の回答生成（+実際の使用トークン数）
     answer, tokens_used = await generate_answer_with_context(chat_id, question)
 
-    # 差分トークンを加算（必要なら制限チェック）
     token_diff = tokens_used - estimated_tokens
+    limited = False
     if token_diff > 0:
-        success = await check_token_limit_and_log(user_id, token_diff)
+        success = await check_token_limit_and_log(user_id, token_diff, db_pool)
         if not success:
-            return {
-                "chat_id": chat_id,
-                "answer": "今日はここまでにしましょう。また明日、静かにお話しましょう。",
-                "limited": True
-            }
+            limited = True
 
-    # 会話保存
     embedding_str = empty_embedding_vector()
     async with db_pool.acquire() as db:
         await db.execute("""
@@ -446,8 +448,10 @@ async def add_message(request: ChatRequest):
     return {
         "chat_id": chat_id,
         "question": question,
-        "answer": answer
+        "answer": answer,
+        "limited": limited
     }
+
 
 
 
