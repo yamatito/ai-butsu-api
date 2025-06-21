@@ -1,22 +1,18 @@
 # ai-butsu-api/utils/ai_response.py
-# ==================================
-#  ✔ 直近 2 ペアは “そのまま” 投入
-#  ✔ それ以前は要約して圧縮
-#  ✔ 「短文保険」を撤廃（短文でも文脈があればそのまま送る）
-# ==================================
+# ai-butsu-api/utils/ai_response.py
 import os, asyncpg
 from typing import List, Dict, Tuple
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
+
 from utils.init import trim_if_needed
+from utils.prompt_assets import SYSTEM_PROMPT, FEW_SHOTS
 
 load_dotenv()
 OPENAI_MODEL          = os.getenv("OPENAI_MODEL",          "gpt-4o")
 OPENAI_SUMMARY_MODEL  = os.getenv("OPENAI_SUMMARY_MODEL",  "gpt-3.5-turbo")
 OPENAI_API_KEY        = os.getenv("OPENAI_API_KEY")
 openai_client         = AsyncOpenAI(api_key=OPENAI_API_KEY)
-
-from utils.prompt_assets import SYSTEM_PROMPT, FEW_SHOTS
 
 # ------------ tiktoken で概算 token 数 -------------
 try:
@@ -31,12 +27,29 @@ SUMMARY_PAIR_MAX      = 6     # 要約を最大 n ペア
 TOKEN_BUDGET_HISTORY  = 900   # user_input を含め 900 token に抑える
 
 # ──────────────────────────────
+# ★ 追加: 質問を最大 1 個に抑えるユーティリティ
+# ──────────────────────────────
+def _limit_questions(text: str, max_q: int = 1) -> str:
+    """
+    出力文中の '?' / '？' を max_q 個だけ残し、
+    それ以外は句点 '。' に置き換える。
+    """
+    q_cnt, out = 0, []
+    for ch in text:
+        if ch in ("?", "？"):
+            q_cnt += 1
+            out.append(ch if q_cnt <= max_q else "。")
+        else:
+            out.append(ch)
+    return "".join(out)
+
+# ──────────────────────────────
 # 1. ペア要約
 # ──────────────────────────────
 async def _summarize_pair(q: str, a: str) -> str:
     prompt = (
         "次の相談と回答を 50 字以内で要約してください。\n"
-        "◆相談: " + q + "\n◆回答: " + a + "\n要約:"
+        f"◆相談: {q}\n◆回答: {a}\n要約:"
     )
     try:
         r = await openai_client.chat.completions.create(
@@ -69,6 +82,7 @@ async def _prepare_history(db: asyncpg.pool.Pool,
         """,
         chat_id,
     )
+
     full_pairs_msgs: List[Dict] = []
     summaries: List[str]        = []
 
@@ -107,7 +121,6 @@ def _build_messages(full_pairs: List[Dict],
         msgs.append({"role": "assistant", "content": f"(要約ログ) {s}"})
 
     msgs.extend(full_pairs)               # 直近のやり取りはそのまま
-
     msgs.append({"role": "user", "content": user_input})
 
     # 念のため 25 ロールに収める
@@ -122,11 +135,13 @@ async def _call_openai(messages: List[Dict]) -> Tuple[str, int]:
     r = await openai_client.chat.completions.create(
         model       = OPENAI_MODEL,
         messages    = messages,
-        max_tokens  = 120,
+        max_tokens  = 120,             # ≒200字・4文で収まる範囲
         temperature = 0.75,
         top_p       = 0.95,
     )
-    text = r.choices[0].message.content.strip().replace("...", "。")
+    text = r.choices[0].message.content.strip()
+    text = text.replace("...", "。")        # 三点リーダ → 句点に統一
+    text = _limit_questions(text)           # 1ターン1質問に強制
     return trim_if_needed(text), r.usage.total_tokens
 
 # ──────────────────────────────
@@ -148,7 +163,6 @@ async def generate_answer_with_context(chat_id: str,
     full_pairs, summaries = await _prepare_history(db, chat_id, user_input)
     messages              = _build_messages(full_pairs, summaries, user_input)
     return await _call_openai(messages)
-
 
 # SYSTEM_PROMPT = (
 #     "あなたは『AI仏』— 静かな本堂に坐し、悩める者へ息づく気づきを授ける存在。"
