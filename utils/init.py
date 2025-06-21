@@ -1,15 +1,20 @@
 
-
-
-# Utility ─ 200 文字超を切り詰める（句点でトリム）
+# init.py
 from datetime import date, datetime
 import json
 import random
 import string
 
+import os
 from asyncpg import Pool
 from fastapi import Depends, Request
-import supabase
+from supabase import create_client    # ← クライアントを生成
+from dotenv import load_dotenv
+
+load_dotenv()
+SUPABASE_URL  = os.getenv("SUPABASE_URL")
+SUPABASE_KEY  = os.getenv("SUPABASE_KEY")
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)  # ← これが本物の client
 
 async def get_db(request: Request):
     return request.app.state.db_pool

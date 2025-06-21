@@ -80,7 +80,7 @@ async def add_message(request: ChatRequest, db=Depends(get_db)):
             "limited": True
         }
 
-    answer, tokens_used = await generate_answer_with_context(chat_id, question)
+    answer, tokens_used = await generate_answer_with_context(chat_id, question, db)
 
     token_diff = tokens_used - estimated_tokens
     limited = False
