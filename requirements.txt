@@ -1,4 +1,4 @@
 fastapi
 uvicorn[standard]
 asyncpg
-supabase-py   ←❗️正しいパッケージ名に修正！
+supabase-py 
