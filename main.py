@@ -37,7 +37,7 @@ async def nightly_reset_task():
         # 現在時刻（JST）
         now = datetime.now(ZoneInfo("Asia/Tokyo"))
         # 次の0時
-        next_midnight = (now  timedelta(days=1)).replace(
+        next_midnight = (now + timedelta(days=1)).replace(
             hour=0, minute=0, second=0, microsecond=0
         )
         wait_sec = (next_midnight - now).total_seconds()
