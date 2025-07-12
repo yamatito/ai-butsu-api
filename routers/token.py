@@ -51,3 +51,33 @@ async def handle_admob_reward(request: Request):
     await reward_tokens_for_ad(user_id, reward_amount * 50)
 
     return {"status": "ok"}
+
+
+
+# 管理者専用の固定トークン（ハードコード）
+_ADMIN_TOKEN = "super_secret_token"
+_DEFAULT_TOKENS = 5000
+
+@router.post("/admin/reset_all_tokens")
+async def reset_all_tokens(request: Request, db=Depends(get_db)):
+    # --- 超シンプルなヘッダートークン認証 ---
+    if request.headers.get("X-ADMIN-TOKEN") != _ADMIN_TOKEN:
+        return {"status": "unauthorized"}
+
+    today = date.today()
+
+    async with db.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE user_tokens
+            SET
+              tokens_remaining = $1,
+              daily_used       = 0,
+              daily_rewarded   = 0,
+              last_reset_date  = $2
+            """,
+            _DEFAULT_TOKENS,
+            today,
+        )
+
+    return {"status": "ok", "date": today.isoformat()}

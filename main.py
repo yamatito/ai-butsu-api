@@ -5,9 +5,12 @@ from dotenv import load_dotenv
 from fastapi.middleware.cors import CORSMiddleware
 from supabase import create_client
 from fastapi import FastAPI, Request
-from contextlib import asynccontextmanager  # ← これを追加！
+from contextlib import asynccontextmanager 
 from routers import chat, user, share, favorites, token, health
-
+import asyncio                    
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+import httpx                    
 
 # ===================================================
 # 🔧 環境設定 & 接続初期化
@@ -23,6 +26,38 @@ DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 # Supabase クライアント
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
+# --- 🔻 Nightly Reset 用 定数 ---
+ADMIN_TOKEN = "super_secret_token"
+# 同ホスト内なら http://127.0.0.1:8000 でOK
+BASE_URL = "https://web-production-0080.up.railway.app"
+
+# 🔻 追加：毎日0時にトークンをリセット
+async def nightly_reset_task():
+    while True:
+        # 現在時刻（JST）
+        now = datetime.now(ZoneInfo("Asia/Tokyo"))
+        # 次の0時
+        next_midnight = (now  timedelta(days=1)).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        wait_sec = (next_midnight - now).total_seconds()
+        await asyncio.sleep(wait_sec)
+
+        try:
+            async with httpx.AsyncClient() as client:
+                resp = await client.post(
+                    f"{BASE_URL}/admin/reset_all_tokens",
+                    headers={"X-ADMIN-TOKEN": ADMIN_TOKEN},
+                    timeout=30,
+                )
+                print("🌓 Nightly reset status:", resp.status_code, await resp.text())
+        except Exception as e:
+            print("❌ Nightly reset failed:", e)
+
+
+
+
+
 # 👇 ここにデコレーターを追加
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -36,6 +71,12 @@ async def lifespan(app: FastAPI):
 
 # lifespan を渡して FastAPI インスタンス作成
 app = FastAPI(lifespan=lifespan)
+
+# スタートアップイベントでスケジューラ起動
+@app.on_event("startup")
+async def _start_nightly_scheduler():
+    asyncio.create_task(nightly_reset_task())
+
 
 # CORS設定
 app.add_middleware(
