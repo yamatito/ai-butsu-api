@@ -1,3 +1,4 @@
+# token.py
 from datetime import date
 
 from fastapi import APIRouter, Depends, Query, Request
@@ -33,24 +34,20 @@ async def get_token_status(user_id: str = Query(...),db=Depends(get_db)):
         }
 
 
-# 広告報酬付与API
-# @app.get("/ad_reward")
-# async def ad_reward(user_id: str, request: Request, db_pool: Pool = Depends(get_db)):
-#     await reward_tokens_for_ad(user_id, db_pool)
-#     return {"status": "ok", "msg": "トークンを回復しました"}
 
 @router.get("/admob/reward")
-async def handle_admob_reward(
-    request: Request,
-):
+async def handle_admob_reward(request: Request):
     params = dict(request.query_params)
-    print("✅ AdMobからのS2S報酬コールバック:", params)
+    print("✅ SSV callback:", params)
 
     user_id = params.get("user_id")
     reward_amount = int(params.get("reward_amount", 0))
 
-    if not user_id or reward_amount != 500:
+    if not user_id or reward_amount <= 0:
         return {"status": "error", "msg": "Invalid reward request"}
 
-    await reward_tokens_for_ad(user_id, reward_amount)
+    # reward_amount が 10なら、10トークンでも、500換算でもOK
+    # 例：1つの報酬 = 50トークン
+    await reward_tokens_for_ad(user_id, reward_amount * 50)
+
     return {"status": "ok"}
