@@ -2,6 +2,7 @@
 from datetime import date
 
 from fastapi import APIRouter, Depends, Query, Request
+from fastapi.responses import JSONResponse
 from utils.init import get_db
 
 from utils.init import reset_daily_if_needed, reward_tokens_for_ad
@@ -36,19 +37,27 @@ async def get_token_status(user_id: str = Query(...),db=Depends(get_db)):
 
 
 @router.get("/admob/reward")
-async def handle_admob_reward(request: Request):
+async def handle_admob_reward(request: Request, db=Depends(get_db)):
+    """
+    AdMob リワード広告の SSV（Server-Side Verification）コールバック。
+    - Google から `GET /admob/reward?...` が届く。
+    - user_id と reward_amount を取り出し、トークンを加算。
+    """
     params = dict(request.query_params)
     print("✅ SSV callback:", params)
 
     user_id = params.get("user_id")
     reward_amount = int(params.get("reward_amount", 0))
 
+    # バリデーション
     if not user_id or reward_amount <= 0:
-        return {"status": "error", "msg": "Invalid reward request"}
+        return JSONResponse(
+            status_code=400,
+            content={"status": "error", "msg": "Invalid reward request"},
+        )
 
-    # reward_amount が 10なら、10トークンでも、500換算でもOK
-    # 例：1つの報酬 = 50トークン
-    await reward_tokens_for_ad(user_id, reward_amount * 50)
+    # ここでトークンを加算（例：報酬量 × 50 トークン）
+    await reward_tokens_for_ad(user_id, reward_amount * 50, db)
 
     return {"status": "ok"}
 

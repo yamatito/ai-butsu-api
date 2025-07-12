@@ -124,7 +124,7 @@ async def check_token_limit_and_log(user_id: str, tokens_used: int, db_pool: Poo
 
 
 # 報酬付与（広告視聴）
-async def reward_tokens_for_ad(user_id: str, reward_amount: int,db=Depends(get_db)):
+async def reward_tokens_for_ad(user_id: str, reward_amount: int, db):
     async with db.acquire() as db:
         await reset_daily_if_needed(db, user_id)
 
