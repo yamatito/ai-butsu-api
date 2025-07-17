@@ -92,8 +92,10 @@ async def handle_admob_reward(request: Request, db=Depends(get_db)):
     reward_amount = int(params.get("reward_amount", 0))
 
     if not user_id or reward_amount <= 0:
-        return JSONResponse(400, {"status": "error", "msg": "Invalid reward"})
-
+     return JSONResponse(
+        status_code=400,
+        content={"status": "error", "msg": "Invalid reward"}
+     )
     # 例: 1 reward → 50 トークン * 倍率
     await reward_tokens_for_ad(user_id, reward_amount * 50, db)
     return {"status": "ok"}
