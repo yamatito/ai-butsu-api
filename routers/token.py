@@ -11,9 +11,9 @@ from utils.init import get_db, reset_daily_if_needed, reward_tokens_for_ad
 router = APIRouter()
 
 # ─────── 設定値（必要なら .env に移動） ───────
-MAX_FREE_TOKENS_PER_DAY     = 5000      # 無料ユーザー 1 日上限
+MAX_FREE_TOKENS_PER_DAY     = 6000      # 無料ユーザー 1 日上限
 MAX_PREMIUM_TOKENS_PER_DAY  = None      # None = 無制限
-TOKENS_ON_AD_WATCH          = 500       # 広告報酬
+TOKENS_ON_AD_WATCH          = 1000       # 広告報酬
 _ADMIN_TOKEN                = os.getenv("ADMIN_TOKEN", "super_secret_token")
 # -----------------------------------------------
 
