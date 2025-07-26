@@ -4,7 +4,7 @@ import os, asyncpg, random
 from typing import List, Dict, Tuple
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
-
+import re
 from utils.init import trim_if_needed
 from utils.prompt_assets import SYSTEM_PROMPT, FEW_SHOTS
 
@@ -117,6 +117,10 @@ def _build_messages(full_pairs: List[Dict],
 
 # ──────────────────────────────
 def _postprocess(text: str, is_bless: bool) -> str:
+   # --- <区分タグ> を除去 ------------------------------------
+    # 行頭または改行直後に現れる [A] / [B] / [C] / [BLESS] を削る
+    text = re.sub(r'(^|\n)\s*\[(?:A|B|C|BLESS)\]\s*', r'\1', text)
+
     text = text.replace("...", "。")
     text = _limit_questions(text)
     if is_bless and random.random() < 0.3 and not text.endswith(("合掌", "南無阿弥陀仏—")):
