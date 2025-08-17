@@ -19,7 +19,7 @@ async def new_chat(request: NewChatRequest, db=Depends(get_db)):
         raise HTTPException(status_code=400, detail="質問が空です。")
 
     # 仮のトークン数でチェック（長さ + 平均回答分）
-    estimated_tokens = len(question) + 100
+    estimated_tokens = _rough_token_estimate(question)
     is_allowed = await check_token_limit_and_log(user_id, estimated_tokens, db)
     if not is_allowed:
         return JSONResponse(
@@ -71,7 +71,7 @@ async def add_message(request: ChatRequest, db=Depends(get_db)):
     if not question:
         raise HTTPException(status_code=400, detail="質問が空です。")
 
-    estimated_tokens = len(question) + 150
+    estimated_tokens = _rough_token_estimate(question)
     is_allowed = await check_token_limit_and_log(user_id, estimated_tokens, db)
     if not is_allowed:
         return {
@@ -107,7 +107,10 @@ async def add_message(request: ChatRequest, db=Depends(get_db)):
     }
 
 
-
+def _rough_token_estimate(text: str) -> int:
+    # 日本語ざっくり想定：2.2文字 ≒ 1token。回答分バッファを足す
+    base = max(1, int(len(text) / 2.2))
+    return base + 300   # 応答バッファ（自動つづき込みでも余裕め）
 
 @router.get("/chat/{chat_id}")
 async def get_chat(chat_id: str,db=Depends(get_db)):

@@ -14,6 +14,12 @@ OPENAI_SUMMARY_MODEL  = os.getenv("OPENAI_SUMMARY_MODEL",  "gpt-3.5-turbo")
 OPENAI_API_KEY        = os.getenv("OPENAI_API_KEY")
 openai_client         = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
+
+CHUNK_MAX_TOKENS       = 320     # 1チャンク出力量（日本語で十分長い）
+CONTINUE_MAX_CHUNKS    = 3       # 続き呼びの最大回数（合計で実質 ~1000tokens 出力可）
+STOP_SEQUENCES         = None    # 明示stop不要なら None のまま
+
+
 # ------------ tiktoken で概算 token 数 -------------
 try:
     from tiktoken import encoding_for_model
@@ -23,8 +29,8 @@ except Exception:
     def _tok_len(text: str) -> int: return len(text) // 2
 
 FULL_PAIR_LIMIT       = 2
-SUMMARY_PAIR_MAX      = 6
-TOKEN_BUDGET_HISTORY  = 900
+TOKEN_BUDGET_HISTORY  = 1200   # 900 → 1200 程度
+SUMMARY_PAIR_MAX      = 8      # 6 → 8（任意）
 
 # ──────────────────────────────
 # BLESS トリガー語
@@ -117,27 +123,46 @@ def _build_messages(full_pairs: List[Dict],
 
 # ──────────────────────────────
 def _postprocess(text: str, is_bless: bool) -> str:
-   # --- <区分タグ> を除去 ------------------------------------
-    # 行頭または改行直後に現れる [A] / [B] / [C] / [BLESS] を削る
-    text = re.sub(r'(^|\n)\s*\[(?:A|B|C|BLESS)\]\s*', r'\1', text)
-
     text = text.replace("...", "。")
-    text = _limit_questions(text)
+    text = _limit_questions(text)            # ← 質問は1つまで
     if is_bless and random.random() < 0.3 and not text.endswith(("合掌", "南無阿弥陀仏—")):
         text += "　合掌"
-    return trim_if_needed(text)
+    return text                              # ← 不要な文字数トリムはしな
 
 # ──────────────────────────────
 async def _call_openai(messages: List[Dict], is_bless: bool) -> Tuple[str, int]:
-    r = await openai_client.chat.completions.create(
-        model       = OPENAI_MODEL,
-        messages    = messages,
-        max_tokens  = 120,
-        temperature = 0.75 if not is_bless else 0.8,
-        top_p       = 0.95,
-    )
-    text = r.choices[0].message.content.strip()
-    return _postprocess(text, is_bless), r.usage.total_tokens
+    """長文でも finish_reason=length を検出して自動で続き取得する"""
+    out_parts: List[str] = []
+    total_tokens_used = 0
+    local_msgs = list(messages)
+
+    for turn in range(CONTINUE_MAX_CHUNKS):
+        r = await openai_client.chat.completions.create(
+            model       = OPENAI_MODEL,
+            messages    = local_msgs,
+            max_tokens  = CHUNK_MAX_TOKENS,
+            temperature = 0.75 if not is_bless else 0.8,
+            top_p       = 0.95,
+            stop        = STOP_SEQUENCES,
+        )
+        part = (r.choices[0].message.content or "").strip()
+        out_parts.append(part)
+        total_tokens_used += (r.usage.total_tokens or 0)
+
+        finish = getattr(r.choices[0], "finish_reason", None)
+        # 途中切れ（length）のときは続きだけを取りにいく
+        if finish == "length":
+            # 直前の出力を会話履歴に積み、「続きのみ」を指示する
+            local_msgs = local_msgs + [
+                {"role": "assistant", "content": part},
+                {"role": "user", "content": "続きのみを同じ文体で出力してください。直前の文は繰り返さないこと。"}
+            ]
+            continue
+        # content_filter/stop/None は終了扱い
+        break
+
+    full_text = _postprocess("".join(out_parts), is_bless)
+    return full_text, total_tokens_used
 
 # ──────────────────────────────
 async def generate_answer(question: str) -> Tuple[str, int]:
