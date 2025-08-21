@@ -6,7 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from supabase import create_client
 from fastapi import FastAPI, Request
 from contextlib import asynccontextmanager 
-from routers import chat, user, share, favorites, token, health
+from routers import chat, omikuji, user, share, favorites, token, health
 import asyncio                    
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -95,4 +95,5 @@ app.include_router(user.router)
 app.include_router(share.router)
 app.include_router(favorites.router)
 app.include_router(token.router)
+app.include_router(omikuji.router)
 app.include_router(health.router)
